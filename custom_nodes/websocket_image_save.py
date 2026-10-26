@@ -22,7 +22,7 @@ class SaveImageWebsocket:
 
     OUTPUT_NODE = True
 
-    CATEGORY = "image"
+    CATEGORY = "api/image"
 
     def save_images(self, images):
         pbar = comfy.utils.ProgressBar(images.shape[0])
@@ -41,8 +41,4 @@ class SaveImageWebsocket:
 
 NODE_CLASS_MAPPINGS = {
     "SaveImageWebsocket": SaveImageWebsocket,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "SaveImageWebsocket": "Save Image (Websocket)",
 }

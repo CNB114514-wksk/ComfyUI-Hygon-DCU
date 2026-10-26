@@ -1,0 +1,49 @@
+diff --git a/comfy/ldm/lightricks/model.py b/comfy/ldm/lightricks/model.py
+index dcbfa43a..0830cbd8 100644
+--- a/comfy/ldm/lightricks/model.py
++++ b/comfy/ldm/lightricks/model.py
+@@ -640,6 +640,44 @@ def generate_freq_grid_np(positional_embedding_theta, positional_embedding_max_p
+     )
+     return torch.tensor(pow_indices * math.pi / 2, dtype=torch.float32)
+ 
++
++# [2026-08 兼容层] 从核心 git 历史 (cd77c551) 恢复的旧版 rope API。
++# ComfyUI 0.30 的 7c59a078 用 comfy kitchen rope 重构删除了这两个函数，
++# 但 ComfyUI-LTXVideo 插件的 embeddings_connector 仍按旧 API 调用。
++# 纯函数，独立于新 API (freqs_cis_matrix/apply_rotary_emb)，仅作兼容。
++def interleaved_freqs_cis(freqs, pad_size):
++    cos_freq = freqs.cos().repeat_interleave(2, dim=-1)
++    sin_freq = freqs.sin().repeat_interleave(2, dim=-1)
++    if pad_size != 0:
++        cos_padding = torch.ones_like(cos_freq[:, :, : pad_size])
++        sin_padding = torch.zeros_like(cos_freq[:, :, : pad_size])
++        cos_freq = torch.cat([cos_padding, cos_freq], dim=-1)
++        sin_freq = torch.cat([sin_padding, sin_freq], dim=-1)
++    return cos_freq, sin_freq
++
++
++def split_freqs_cis(freqs, pad_size, num_attention_heads):
++    cos_freq = freqs.cos()
++    sin_freq = freqs.sin()
++
++    if pad_size != 0:
++        cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
++        sin_padding = torch.zeros_like(sin_freq[:, :, :pad_size])
++
++        cos_freq = torch.concatenate([cos_padding, cos_freq], axis=-1)
++        sin_freq = torch.concatenate([sin_padding, sin_freq], axis=-1)
++
++    # Reshape freqs to be compatible with multi-head attention
++    B, T, half_HD = cos_freq.shape
++
++    cos_freq = cos_freq.reshape(B, T, num_attention_heads, half_HD // num_attention_heads)
++    sin_freq = sin_freq.reshape(B, T, num_attention_heads, half_HD // num_attention_heads)
++
++    cos_freq = torch.swapaxes(cos_freq, 1, 2)  # (B,H,T,D//2)
++    sin_freq = torch.swapaxes(sin_freq, 1, 2)  # (B,H,T,D//2)
++    return cos_freq, sin_freq
++
++
+ def generate_freq_grid_pytorch(positional_embedding_theta, positional_embedding_max_pos_count, inner_dim, device):
+     theta = positional_embedding_theta
+     start = 1

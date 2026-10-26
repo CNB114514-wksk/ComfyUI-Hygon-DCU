@@ -1,0 +1,75 @@
+diff --git a/comfy/text_encoders/llama.py b/comfy/text_encoders/llama.py
+index db36fc37..99721be6 100644
+--- a/comfy/text_encoders/llama.py
++++ b/comfy/text_encoders/llama.py
+@@ -973,16 +973,15 @@ class Llama2_(nn.Module):
+ 
+         optimized_attention = optimized_attention_for_device(x.device, mask=mask is not None, small_input=True)
+ 
+-        enable_graph = self.graph_dynamic_vbar_blocks and (fixed_kv_decode or spec_decode)
++        # A graphed layer bakes the address of its input buffer, so capture only makes
++        # sense when the static decode_buffers exist; otherwise the eager clone path runs.
++        enable_graph = self.graph_dynamic_vbar_blocks and (fixed_kv_decode or spec_decode) and decode_buffers is not None
+         if enable_graph:
+-            if decode_buffers is None:
+-                x = x.clone()
+-            else:
+-                hidden_buffer, rotary_buffer = decode_buffers
+-                hidden_buffer.copy_(x)
+-                x = hidden_buffer
+-                rotary_buffer.copy_(rope_matrix(freqs_cis))
+-                freqs_cis = rotary_buffer
++            hidden_buffer, rotary_buffer = decode_buffers
++            hidden_buffer.copy_(x)
++            x = hidden_buffer
++            rotary_buffer.copy_(rope_matrix(freqs_cis))
++            freqs_cis = rotary_buffer
+ 
+         intermediate = None
+         all_intermediate = None
+@@ -1029,7 +1028,7 @@ class Llama2_(nn.Module):
+ 
+             comfy.model_prefetch.prefetch_queue_pop(
+                 prefetch_queue, x.device, layer, x.dtype, core=core, enable_graph=enable_graph,
+-                malloc_scope="block"
++                malloc_scope="block", allow_bare_graph=True
+             )
+             if fixed_kv:
+                 next_key_values[i].advance(seq_len)
+@@ -1164,13 +1163,22 @@ class BaseGenerate:
+         # MRoPE: prefill uses explicit 3D position_ids, decode continues from the last position
+         next_pos = int(position_ids[:, -1].max()) + 1 if position_ids is not None else None
+ 
+-        compile_allocations = self.model.graph_dynamic_vbar_blocks and comfy.model_prefetch.malloc_graph_enabled(device)
++        compile_allocations = self.model.graph_dynamic_vbar_blocks and (comfy.model_prefetch.malloc_graph_enabled(device) or comfy.model_prefetch.cuda_graphs_usable(device))
+         decode_buffers = None
+         if compile_allocations and not comfy.model_management.args.disable_cuda_graphs:
+             init_decode_buffers = getattr(self.model, "init_decode_buffers", None)
+             if init_decode_buffers is not None:
+                 decode_buffers = init_decode_buffers(embeds.shape[0], device, execution_dtype)
++        if decode_buffers is not None and not comfy.model_prefetch.malloc_graph_enabled(device):
++            # Without aimdo the cached graphs point at this call's KV cache and decode
++            # buffers, so they must not survive into the next generate().
++            comfy.model_prefetch.reset_graphs(list(getattr(self.model, "layers", [])))
+         decode_tokens = torch.empty((embeds.shape[0], 1), dtype=torch.long, device=device)
++        # A graphed decode step must read its RoPE position from a fixed buffer, not a
++        # fresh tensor: the captured graph would otherwise pin the first step's position.
++        position_ids_buffer = None
++        if decode_buffers is not None and next_pos is not None:
++            position_ids_buffer = torch.empty((embeds.shape[0], 1), dtype=torch.long, device=device)
+         penalize = penalty_active(repetition_penalty, presence_penalty)
+         penalty_mask = None
+ 
+@@ -1182,7 +1190,11 @@ class BaseGenerate:
+                     comfy.model_prefetch.malloc_graph_begin(device)
+                 embeds = self.model.embed_tokens(decode_tokens).to(execution_dtype)
+                 current_input_ids = decode_tokens if initial_input_ids is not None else None
+-                position_ids = torch.tensor([[next_pos]], device=device) if next_pos is not None else None
++                if position_ids_buffer is not None:
++                    position_ids_buffer.fill_(next_pos)
++                    position_ids = position_ids_buffer
++                else:
++                    position_ids = torch.tensor([[next_pos]], device=device) if next_pos is not None else None
+ 
+             # DeepStack visual features are injected on the prefill only; gemma4's forward lacks these kwargs.
+             extra = {}

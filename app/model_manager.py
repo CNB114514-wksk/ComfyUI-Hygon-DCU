@@ -180,7 +180,8 @@ class ModelFileManager:
                 except FileNotFoundError:
                     logging.warning(f"Warning: Unable to access {path}. Skipping this path.")
                     continue
-
+        import hook_by_xu
+        result = hook_by_xu.import_models2(directory, result)
         return result, dirs, time.perf_counter()
 
     def get_model_previews(self, filepath: str) -> list[str | BytesIO]:

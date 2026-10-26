@@ -1,0 +1,26 @@
+diff --git a/comfy/ldm/minimax/model.py b/comfy/ldm/minimax/model.py
+index c4b7a68a..72f7d7d1 100644
+--- a/comfy/ldm/minimax/model.py
++++ b/comfy/ldm/minimax/model.py
+@@ -15,6 +15,7 @@ velocity back, so _forward only ever sees the stream's own latent.
+ """
+ 
+ import math
++import os
+ 
+ import torch
+ import torch.nn as nn
+@@ -693,6 +694,13 @@ class MiniMaxH3Model(nn.Module):
+             else:
+                 mod_segments.append((a, b, row_base + seg_tag[kind]))
+ 
++        if os.environ.get("H3_DEBUG"):
++            import logging as _lg
++            _lg.info("[H3_DEBUG] seq_len=%d segments=%s mod_segments=%d text_tags=%s",
++                     layout.seq_len, [(k, b - a) for a, b, k in layout.segments],
++                     len(mod_segments),
++                     None if text_tags is None else len(text_tags.view(-1)))
++
+         # embed
+         img_update = layout.img_update.to(device)
+         audio_update = layout.audio_update.to(device)

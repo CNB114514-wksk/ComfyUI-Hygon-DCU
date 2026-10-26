@@ -1353,6 +1353,28 @@ def sample(model, noise, positive, negative, cfg, device, sampler, sigmas, model
     return cfg_guider.sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
 
 
+# DCU debug hook: CK_PROFILE=1 dumps a CUDA-time kernel breakdown for the sampling
+# loop to /tmp/ck_profile.txt.  Off by default; no effect on normal runs.
+_orig_cfgguider_sample = CFGGuider.sample
+
+def _profiled_cfgguider_sample(self, *args, **kwargs):
+    import os
+    if not os.environ.get("CK_PROFILE"):
+        return _orig_cfgguider_sample(self, *args, **kwargs)
+    import torch
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        out = _orig_cfgguider_sample(self, *args, **kwargs)
+    txt = prof.key_averages().table(sort_by="cuda_time_total", row_limit=45)
+    with open("/tmp/ck_profile.txt", "w") as f:
+        f.write(txt + "\n")
+    if os.environ.get("CK_PROFILE_TRACE"):
+        prof.export_chrome_trace("/tmp/ck_trace.json")
+    logging.info("CK_PROFILE written to /tmp/ck_profile.txt")
+    return out
+
+CFGGuider.sample = _profiled_cfgguider_sample
+
+
 SAMPLER_NAMES = KSAMPLER_NAMES + ["ddim", "uni_pc", "uni_pc_bh2"]
 
 class SchedulerHandler(NamedTuple):

@@ -1,4 +1,126 @@
 import os
+import hook_by_xu
+# [2026-09-02] 自动下载线程数自适应：默认 32（cnb 实测 112MiB/s），自动下载触发时后台测速，
+# 5 分钟窗口均值 <30MiB/s 视为当天 cnb 限速，自动降回 16 并写状态文件，直到跑 qhxc 切回。
+# 历史注：2026-08-25 曾统一 16（当时 32 线程被 CDN 限速 18MiB/s、16 线程 76MiB/s）。
+SPEED_STATE_FILE = '/tmp/aria2c_speed_state.json'
+SPEED_WINDOW_SECONDS = 300          # 5 分钟评估窗口
+SPEED_SAMPLE_INTERVAL = 5           # 文件大小采样间隔
+SPEED_THRESHOLD = 30 * 1048576      # 30MiB/s
+_LOW_THREADS = '16'
+_HIGH_THREADS = '32'
+
+
+def _read_thread_state():
+    import json
+    try:
+        with open(SPEED_STATE_FILE) as f:
+            return json.load(f).get('threads', _HIGH_THREADS)
+    except (OSError, ValueError):
+        return _HIGH_THREADS
+
+
+def _write_thread_state(threads, reason=''):
+    import json
+    import time as _time
+    try:
+        with open(SPEED_STATE_FILE, 'w') as f:
+            json.dump({'threads': threads, 'reason': reason, 'ts': _time.time()}, f)
+    except OSError:
+        pass
+
+
+def _find_aria2c_pid(file_path):
+    # 找下载目标文件的 aria2c 进程：cmdline 含 "-o <basename>" 且 "-d <dirname>"
+    import glob
+    base = os.path.basename(file_path)
+    directory = os.path.dirname(file_path)
+    for cmdline_path in glob.glob('/proc/[0-9]*/cmdline'):
+        try:
+            with open(cmdline_path, 'rb') as f:
+                argv = f.read().split(b'\0')
+        except OSError:
+            continue
+        if not argv or not argv[0].endswith(b'aria2c'):
+            continue
+        try:
+            o = argv[argv.index(b'-o') + 1].decode()
+            d = argv[argv.index(b'-d') + 1].decode()
+        except (ValueError, IndexError, UnicodeDecodeError):
+            continue
+        if o == base and os.path.realpath(d) == os.path.realpath(directory):
+            return int(cmdline_path.split('/')[2])
+    return None
+
+
+def _read_write_bytes(pid):
+    try:
+        with open('/proc/%d/io' % pid) as f:
+            for line in f:
+                if line.startswith('write_bytes:'):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _speed_monitor(file_path, stop_flag):
+    # 5 分钟窗口内按 aria2c 进程 write_bytes 增量估均值（getsize 会被 prealloc 预分配糊弄，
+    # .aria2 控制文件 bitfield 非实时，只有 /proc io 统计是真实写盘速率）。
+    # <30MiB/s 切回 16（qhxc 可恢复）
+    import time as _time
+    start = _time.time()
+    samples = []  # (ts, write_bytes)
+    while not stop_flag.is_set():
+        _time.sleep(SPEED_SAMPLE_INTERVAL)
+        pid = _find_aria2c_pid(file_path)
+        if pid is None:
+            if _time.time() - start > SPEED_SAMPLE_INTERVAL * 2:
+                break  # 下载已结束/未启动
+            continue
+        wb = _read_write_bytes(pid)
+        if wb is not None:
+            samples.append((_time.time(), wb))
+        if _time.time() - start >= SPEED_WINDOW_SECONDS:
+            break
+    # 取窗口内首尾有效样本
+    if len(samples) < 2:
+        return
+    first_ts, first_wb = samples[0]
+    last_ts, last_wb = samples[-1]
+    elapsed = last_ts - first_ts
+    written = last_wb - first_wb
+    if elapsed < SPEED_WINDOW_SECONDS * 0.5 or written <= 0:
+        return
+    speed = written / elapsed
+    import logging
+    if speed < SPEED_THRESHOLD:
+        _write_thread_state(_LOW_THREADS, reason='speed %.1fMiB/s < 30MiB/s' % (speed / 1048576))
+        logging.warning(
+            "[aria2c] 5分钟均值 %.1fMiB/s 低于 30MiB/s，自动下载已从 32 线程切换到 16 线程。"
+            "恢复 32 线程请在终端执行 qhxc", speed / 1048576)
+    else:
+        logging.info("[aria2c] 5分钟均值 %.1fMiB/s，维持 32 线程", speed / 1048576)
+
+
+def _build_aria2c_cmd():
+    threads = _read_thread_state()
+    return f'aria2c -x {threads} -s {threads}'
+
+
+_orig_aria2c = hook_by_xu.aria2c
+def _aria2c_hook(file_path, url, aria2c_cmd=''):
+    if not aria2c_cmd or 'aria2c -x' not in aria2c_cmd:
+        aria2c_cmd = _build_aria2c_cmd()
+    import threading
+    stop_flag = threading.Event()
+    monitor = threading.Thread(target=_speed_monitor, args=(file_path, stop_flag), daemon=True)
+    monitor.start()
+    try:
+        return _orig_aria2c(file_path, url, aria2c_cmd)
+    finally:
+        stop_flag.set()
+hook_by_xu.aria2c = _aria2c_hook
 import time
 import mimetypes
 import logging
@@ -64,7 +186,7 @@ folder_names_and_paths["geometry_estimation"] = ([os.path.join(models_dir, "geom
 
 folder_names_and_paths["optical_flow"] = ([os.path.join(models_dir, "optical_flow")], supported_pt_extensions)
 
-folder_names_and_paths["detection"] = ([os.path.join(models_dir, "detection")], supported_pt_extensions)
+folder_names_and_paths["detection"] = ([os.path.join(models_dir, "detection")], list(supported_pt_extensions) + [".onnx"])
 
 output_directory = os.path.join(base_path, "output")
 temp_directory = os.path.join(base_path, "temp")
@@ -394,7 +516,8 @@ def get_folder_paths(folder_name: str) -> list[str]:
 
 def recursive_search(directory: str, excluded_dir_names: list[str] | None=None) -> tuple[list[str], dict[str, float]]:
     if not os.path.isdir(directory):
-        return [], {}
+        os.makedirs(directory, exist_ok=True)
+        # return [], {}
 
     if excluded_dir_names is None:
         excluded_dir_names = []
@@ -430,6 +553,7 @@ def recursive_search(directory: str, excluded_dir_names: list[str] | None=None) 
             except FileNotFoundError:
                 logging.warning(f"Warning: Unable to access {path}. Skipping this path.")
                 continue
+    result = hook_by_xu.import_models(directory, result)
     logging.debug("found {} files".format(len(result)))
     return result, dirs
 
@@ -444,6 +568,9 @@ def get_full_path(folder_name: str, filename: str) -> str | None:
     """
     global folder_names_and_paths
     folder_name = map_legacy(folder_name)
+    path = hook_by_xu.find_or_download_model(folder_name, filename)
+    if path:
+        return path
     if folder_name not in folder_names_and_paths:
         return None
     folders = folder_names_and_paths[folder_name]
@@ -514,8 +641,9 @@ def get_filename_list(folder_name: str) -> list[str]:
         out = get_filename_list_(folder_name)
         global filename_list_cache
         filename_list_cache[folder_name] = out
+    out = hook_by_xu.import_filename_list(folder_name, out)
     cache_helper.set(folder_name, out)
-    return list(out[0])
+    return sorted(list(out[0]))
 
 def get_save_image_path(filename_prefix: str, output_dir: str, image_width=0, image_height=0) -> tuple[str, str, int, str, str]:
     def map_filename(filename: str) -> tuple[int, str]:

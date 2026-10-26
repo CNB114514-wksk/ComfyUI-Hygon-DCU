@@ -69,6 +69,58 @@ if args.enable_manager:
     import comfyui_manager
 
 
+# ===== [o.o 2026-09-13] 自动下载准入检查（防"全量下载"）=====
+# 背景：hook_by_xu.find_or_download_model 在 enable_auto_download=True 的窗口内
+#       会把"缺失的模型"批量拉下来。当请求没有有效 workflow（前端卡死 / 脏请求 / API 提交）时，
+#       它会按 source.json / source-community.json 清单大范围补齐，
+#       实测一次拉了 10Eros_v1.4_bf16 / 10Eros_v1_fp8_transformer / 512-inpainting-ema /
+#       DasiwaLTX23_dragonleapV4 等 5 个"主模型"(合计 100G+)，把 450G 盘写满导致 ComfyUI 异常。
+# 规则：1) 请求必须携带有效 workflow（含 nodes）；2) 该 workflow 引用的模型文件数 <= 6。
+#       两者任一不满足 → 本次任务不开启自动下载。
+_AUTODL_MODEL_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".sft", ".onnx", ".pkl")
+_AUTODL_MAX_MODELS = 20
+
+
+def _autodl_collect_model_names(workflow):
+    names = set()
+    stack = [workflow]
+    while stack:
+        g = stack.pop()
+        if not isinstance(g, dict):
+            continue
+        for n in g.get("nodes", []) or []:
+            if not isinstance(n, dict):
+                continue
+            for v in (n.get("widgets_values") or []):
+                if isinstance(v, str):
+                    s = v.strip()
+                    if s.lower().endswith(_AUTODL_MODEL_EXTS):
+                        names.add(s)
+            if "nodes" in n:
+                stack.append(n)
+    return names
+
+
+def _autodl_request_is_sane(json_data):
+    """返回 (是否允许开启自动下载, 原因)。"""
+    try:
+        extra_data = json_data.get("extra_data") or {}
+        png = extra_data.get("extra_pnginfo") or {}
+        workflow = png.get("workflow")
+    except Exception:
+        workflow = None
+    if not isinstance(workflow, dict) or not workflow.get("nodes"):
+        return False, "请求未携带有效 workflow（前端异常/API 提交），禁止自动下载"
+    try:
+        names = _autodl_collect_model_names(workflow)
+    except Exception:
+        names = set()
+    if len(names) > _AUTODL_MAX_MODELS:
+        preview = ", ".join(sorted(names)[:4])
+        return False, f"workflow 引用 {len(names)} 个模型文件(> {_AUTODL_MAX_MODELS})，疑似异常：{preview}…"
+    return True, ""
+
+
 def _remove_sensitive_from_queue(queue: list) -> list:
     """Remove sensitive data (index 5) from queue item tuples."""
     return [item[:5] for item in queue]
@@ -90,7 +142,7 @@ async def deprecation_warning(request: web.Request, handler):
 
     if path.startswith("/scripts/ui") or path.startswith("/extensions/core/"):
         # Only warn once per unique file path
-        if path not in _deprecated_paths_warned:
+        if False: #path not in _deprecated_paths_warned:
             _deprecated_paths_warned.add(path)
             logging.warning(
                 f"[DEPRECATION WARNING] Detected import of deprecated legacy API: {path}. "
@@ -331,6 +383,12 @@ class PromptServer():
 
         @routes.get("/")
         async def get_root(request):
+            import hook_by_xu
+            # 有任务在跑时不关开关：页面加载(尤其慢加载时)的 GET / 落在执行中间,
+            # 会把刚由 /prompt 打开的自动下载关掉, 模型检查时误判"不下载"直接报错
+            if not self.prompt_queue.currently_running and hook_by_xu.enable_auto_download:
+                hook_by_xu.enable_auto_download = False
+                print("UI refreshed, disable auto-download function.")
             response = web.FileResponse(os.path.join(self.web_root, "index.html"))
             response.headers['Cache-Control'] = 'no-store, must-revalidate'
             response.headers["Pragma"] = "no-cache"
@@ -807,6 +865,13 @@ class PromptServer():
 
         @routes.get("/object_info")
         async def get_object_info(request):
+            import hook_by_xu
+            # 同 get_root: 执行中不关开关(前端加载/重试的 object_info 会关掉刚开的自动下载)
+            if not self.prompt_queue.currently_running:
+                if hook_by_xu.enable_auto_download:
+                    hook_by_xu.enable_auto_download = False
+                    print("UI refreshed, disable auto-download function.")
+            hook_by_xu.refresh_source()
             self.asset_manager.ensure_scan_started()
             with folder_paths.cache_helper:
                 out = {}
@@ -1116,7 +1181,18 @@ class PromptServer():
                     partial_execution_targets = json_data["partial_execution_targets"]
 
                 self.node_replace_manager.apply_replacements(prompt)
-
+                import hook_by_xu
+                # [o.o 2026-09-13] 防"全量下载"：只有请求带有效 workflow 且引用模型数量合理时才允许自动下载
+                _adl_ok, _adl_why = _autodl_request_is_sane(json_data)
+                if not hook_by_xu.enable_auto_download:
+                    if _adl_ok:
+                        hook_by_xu.enable_auto_download = True
+                        print("Job starts, enable auto-download function.")
+                    else:
+                        print(f"[auto-download-guard] 拒绝开启自动下载：{_adl_why}")
+                elif not _adl_ok:
+                    hook_by_xu.enable_auto_download = False
+                    print(f"[auto-download-guard] 关闭自动下载：{_adl_why}")
                 valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)
                 extra_data = {}
                 if "extra_data" in json_data:
@@ -1220,6 +1296,12 @@ class PromptServer():
                     self.prompt_queue.delete_history_item(id_to_delete)
 
             return web.Response(status=200)
+
+        try:
+            from custom_nodes.Comfyui_StartPatch import server_patch
+            server_patch.apply_patch(self)
+        except ImportError:
+            pass
 
     async def setup(self):
         timeout = aiohttp.ClientTimeout(total=None) # no timeout

@@ -1055,6 +1055,20 @@ async def validate_inputs(prompt_id, prompt, item, validated, visiting=None):
                     else:
                         invalid_vals = [val] if val not in combo_options else []
                     if invalid_vals:
+                        found_similar_choice = False
+                        try:
+                            match_str = val.replace("\\", "/").split("/")[-1].lower()
+                            if "." in match_str:
+                                for i in combo_options:
+                                    if match_str == i.split("/")[-1].lower():
+                                        inputs[x] = i
+                                        found_similar_choice = True
+                                        print(f"Didn't find {val}, changed to {i}")
+                                        break
+                        except:
+                            pass
+                        if found_similar_choice:
+                            continue
                         input_config = info
                         list_info = ""
 

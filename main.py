@@ -11,6 +11,8 @@ if args.list_feature_flags:
     raise SystemExit(0)
 
 import os
+import warnings
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 import importlib.util
 import shutil
 import importlib.metadata
@@ -35,6 +37,61 @@ import sys
 from comfy_execution.progress import get_progress_state
 from comfy_execution.utils import get_executing_context
 from comfy_api import feature_flags
+
+# ===== [o.o 2026-09-13] 自动下载保险丝：禁止"全量下载" =====
+# 背景：hook_by_xu 在 enable_auto_download=True 的窗口内会对"缺失的模型"批量拉取；
+#       请求没有有效 workflow 时（前端卡死/脏请求），它会按 source*.json 清单把一堆主模型
+#       一起下下来（实测 10Eros_v1.4 / DasiwaLTX23 / 512-inpainting-ema …，100G+），曾把 450G 盘写满。
+# 第一道保险在 server.py 的准入检查（_autodl_request_is_sane）；这里是第二道：
+#   下载窗口内累计触发的模型数 > _AUTODL_MAX_FILES，或磁盘剩余 < _AUTODL_MIN_FREE_GB
+#   → 立即关闭自动下载并终止全部 aria2c。
+_AUTODL_MAX_FILES = 10
+_AUTODL_MIN_FREE_GB = 20.0
+
+
+def _autodl_fuse_watchdog():
+    import subprocess
+    import time as _t
+    seen = set()
+    while True:
+        _t.sleep(4)
+        try:
+            import hook_by_xu
+            if not getattr(hook_by_xu, "enable_auto_download", False):
+                seen.clear()
+                continue
+            try:
+                out = subprocess.run(["pgrep", "-af", "aria2c"], capture_output=True, text=True).stdout
+            except Exception:
+                out = ""
+            for line in out.splitlines():
+                if " -o " in line:
+                    seen.add(line.split(" -o ", 1)[1].split(" ")[0])
+                elif line.strip():
+                    seen.add(line.strip()[:80])
+            try:
+                free_gb = shutil.disk_usage(folder_paths.models_dir).free / 2**30
+            except Exception:
+                free_gb = 999.0
+            reason = None
+            if len(seen) > _AUTODL_MAX_FILES:
+                reason = f"本次任务已触发 {len(seen)} 个模型下载（上限 {_AUTODL_MAX_FILES}）"
+            elif free_gb < _AUTODL_MIN_FREE_GB:
+                reason = f"磁盘剩余 {free_gb:.1f}G < {_AUTODL_MIN_FREE_GB}G"
+            if reason:
+                hook_by_xu.enable_auto_download = False
+                try:
+                    subprocess.run(["pkill", "-f", "aria2c"], check=False)
+                except Exception:
+                    pass
+                print(f"[auto-download-fuse] 熔断：{reason} → 已关闭自动下载并终止 aria2c")
+                seen.clear()
+        except Exception as _e:
+            print(f"[auto-download-fuse] 看门狗异常（忽略）：{_e}")
+
+
+import threading as _autodl_threading
+_autodl_threading.Thread(target=_autodl_fuse_watchdog, daemon=True).start()
 
 if __name__ == "__main__":
     #NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
@@ -385,6 +442,9 @@ def prompt_worker(q, server_instance, asset_manager):
                     logging.info(f"Prompt executed in {execution_time}", extra={'color': 'green'})
                 else:
                     logging.info("Prompt executed in {:.2f} seconds".format(execution_time), extra={'color': 'green'})
+                    import hook_by_xu
+                    hook_by_xu.enable_auto_download = False
+                    print("Job finished, disable auto-download function.")
 
             flags = q.get_flags()
             free_memory = flags.get("free_memory", False)
@@ -439,9 +499,12 @@ def hijack_progress(server_instance):
             node_id = executing_context.node_id
         comfy.model_management.throw_exception_if_processing_interrupted()
         if prompt_id is None:
-            prompt_id = server_instance.last_prompt_id
+            # [o.o 2026-09-12] 自动下载(hook_by_xu)可能在没有任何任务上下文时触发
+            #   (例如前端 better_combos 拉模型列表), 此时 last_prompt_id 尚未被赋值,
+            #   原写法抛 AttributeError 会让请求 500。改为安全取用。
+            prompt_id = getattr(server_instance, "last_prompt_id", None)
         if node_id is None:
-            node_id = server_instance.last_node_id
+            node_id = getattr(server_instance, "last_node_id", None)
         progress = {"value": value, "max": total, "prompt_id": prompt_id, "node": node_id}
         get_progress_state().update_progress(node_id, value, total, preview_image)
 
