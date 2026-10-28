@@ -1,5 +1,7 @@
 # ComfyUI · Hygon DCU (base on o.o-comfyui)
 
+base version： https://www.scnet.cn/ui/aihub/image/scnet_xu/2077623634511740929
+
 A working fork of [ComfyUI](https://github.com/Comfy-Org/ComfyUI) for **Hygon K100_AI**
 (`gfx928`). The complete tree is committed, so `git clone` gives you a runnable
 install — not a patch stack you have to assemble first.
