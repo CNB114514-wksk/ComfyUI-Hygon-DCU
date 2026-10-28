@@ -1,4 +1,4 @@
-# ComfyUI · Hygon DCU
+# ComfyUI · Hygon DCU (base on o.o-comfyui)
 
 A working fork of [ComfyUI](https://github.com/Comfy-Org/ComfyUI) for **Hygon K100_AI**
 (`gfx928`). The complete tree is committed, so `git clone` gives you a runnable
